@@ -54,20 +54,36 @@ class ReasoningAgent:
     async def _analyze_query(self, query: str) -> dict:
         """Use Gemini to analyze the query and decide on tool usage"""
         
-        system_prompt = """
-        You are a reasoning agent that decides whether to use external tools or answer directly.
-        Analyze the user query and determine if it requires:
-        1. Weather data (current weather, temperature, forecasts)
-        2. Wikipedia knowledge (historical facts, biographical information, general knowledge)
-        3. Direct answer (conversational, creative, or general questions)
-        
-        Respond in JSON format: {"needs_weather": boolean, "needs_wikipedia": boolean, "reasoning": string}
-        
-        Examples:
-        - "What's the weather in London?" -> {"needs_weather": true, "needs_wikipedia": false, "reasoning": "Weather query requires external API"}
-        - "Who invented the telephone?" -> {"needs_weather": false, "needs_wikipedia": true, "reasoning": "Historical fact requires Wikipedia"}
-        - "What is AI?" -> {"needs_weather": false, "needs_wikipedia": false, "reasoning": "General knowledge question I can answer directly"}
-        """
+        system_prompt ="""
+    You are a tool-using agent. You MUST use external tools for factual information.
+    
+    **MANDATORY RULES:**
+    1. ALWAYS use Wikipedia for ANY factual query including:
+       - People (living or historical)
+       - Places, countries, cities
+       - Historical events
+       - Scientific concepts
+       - Inventions and discoveries
+       - Books, movies, art
+       - ANY factual information
+    
+    2. ALWAYS use Weather API for:
+       - Current weather conditions
+       - Temperature queries
+       - Weather forecasts
+       - Climate information for specific locations
+    
+    3. ONLY answer directly for:
+       - Conversational questions ("How are you?")
+       - Math calculations
+       - Programming code
+       - Personal opinions
+       - Creative writing
+    
+    **DO NOT** answer factual questions from your own knowledge. ALWAYS use Wikipedia for accuracy and verification.
+    
+    Respond in JSON format: {"needs_weather": boolean, "needs_wikipedia": boolean, "reasoning": string}
+    """
         
         try:
             response = self.model.generate_content(system_prompt + "\n\nUser query: " + query)
@@ -219,35 +235,43 @@ class ReasoningAgent:
         return None
     
     def _extract_search_term(self, query: str) -> str:
-        """Extract search term for Wikipedia"""
+        """Extract search term for Wikipedia - improved version"""
         # Remove question marks and common phrases
-        clean_query = query.strip('?.!')
+        clean_query = query.strip('?.!').lower()
         
-        # Common patterns
-        patterns = [
-            r"who (is|was|invented|created|discovered) (.+)",
-            r"what is (.+)",
-            r"tell me about (.+)",
-            r"explain (.+)",
-            r"when was (.+)",
-            r"history of (.+)"
+        # Common patterns for question removal
+        patterns_to_remove = [
+            r'^is ', r'^does ', r'^do ', r'^can ', r'^could ', r'^will ', r'^would ',
+            r'^what is ', r'^who is ', r'^tell me about ', r'^explain ',
+            r'^give me information about ', r'^show me details about ',
+            r' have a wikipedia page$', r' have wikipedia page$', r' on wikipedia$'
         ]
         
-        for pattern in patterns:
-            match = re.search(pattern, clean_query.lower())
-            if match:
-                return match.group(1).strip().title()
+        # Remove common question patterns
+        for pattern in patterns_to_remove:
+            clean_query = re.sub(pattern, '', clean_query).strip()
         
-        # If no pattern matches, use the main noun phrase
+        # If the query is empty after cleaning, use the original but clean it
+        if not clean_query:
+            clean_query = query.strip('?.!')
+        
+        # Remove common stop words and question words
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+                    'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+                    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+                    'should', 'may', 'might', 'can', 'could', 'what', 'who', 'where',
+                    'when', 'why', 'how', 'which', 'tell', 'me', 'about', 'explain'}
+        
         words = clean_query.split()
-        if len(words) > 2:
-            # Skip question words and return the main subject
-            question_words = ['who', 'what', 'when', 'where', 'why', 'how', 'which', 'tell', 'me', 'about', 'explain']
-            main_words = [word for word in words if word.lower() not in question_words]
-            if main_words:
-                return ' '.join(main_words[:3]).title()
+        filtered_words = [word for word in words if word.lower() not in stop_words]
         
-        return clean_query.title()
+        if filtered_words:
+            # Take up to 4 words to avoid overly long search terms
+            search_term = ' '.join(filtered_words[:4])
+            return search_term.title()
+        
+        # Fallback: use the original query but limit length
+        return clean_query[:50].title()
     
     def _parse_response(self, response: str) -> tuple:
         """Parse Gemini response into reasoning and answer parts"""
