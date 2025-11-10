@@ -1,3 +1,5 @@
+import asyncio
+import time
 import google.generativeai as genai
 import os
 import json
@@ -14,7 +16,7 @@ class ReasoningAgent:
         
         genai.configure(api_key=api_key)
         
-        # Use Gemini 2.5 Flash specifically
+        # Use Gemini 2.0 Flash specifically
         try:
             self.model = genai.GenerativeModel('gemini-2.0-flash')
             print("Successfully loaded model: Gemini 2.0 Flash")
@@ -37,19 +39,102 @@ class ReasoningAgent:
         self.weather_tool = WeatherTool()
         self.wikipedia_tool = WikipediaTool()
         
+        # Rate limiting variables
+        self.last_request_time = 0
+        self.min_request_interval = 5.0  # 5 seconds between requests
+        self.recent_errors = 0
+        
+    async def _rate_limit(self):
+        """Add delay between requests with error cooldown"""
+        current_time = time.time()
+        time_since_last_request = current_time - self.last_request_time
+        
+        # Longer delay if we recently had errors
+        base_interval = self.min_request_interval
+        if self.recent_errors > 0:
+            base_interval = 10.0  # 10 seconds after errors
+        
+        if time_since_last_request < base_interval:
+            wait_time = base_interval - time_since_last_request
+            print(f"Rate limiting: Waiting {wait_time:.2f} seconds before next request")
+            await asyncio.sleep(wait_time)
+        
+        self.last_request_time = time.time()
+        
     async def process_query(self, query: str) -> dict:
         """Main method to process user queries with reasoning and tool usage"""
         
-        # Step 1: Analyze query and decide if external APIs are needed
-        reasoning_plan = await self._analyze_query(query)
+        # Step 1: Try to analyze query with Gemini, but fallback to keyword analysis if it fails
+        try:
+            await self._rate_limit()  # Add delay before first Gemini call
+            reasoning_plan = await self._analyze_query(query)
+            self.recent_errors = max(0, self.recent_errors - 1)  # Reduce error count on success
+        except Exception as e:
+            print(f"Analysis failed, using keyword fallback: {e}")
+            self.recent_errors += 1
+            reasoning_plan = await self._keyword_analysis(query)
         
         # Step 2: Execute the plan (call external APIs if needed)
         external_data = await self._execute_plan(reasoning_plan, query)
         
         # Step 3: Generate final response with reasoning
-        final_response = await self._generate_final_response(query, reasoning_plan, external_data)
+        try:
+            await self._rate_limit()  # Add delay before second Gemini call
+            final_response = await self._generate_final_response(query, reasoning_plan, external_data)
+            self.recent_errors = max(0, self.recent_errors - 1)  # Reduce error count on success
+        except Exception as e:
+            print(f"Final response failed, using fallback: {e}")
+            self.recent_errors += 1
+            final_response = await self._fallback_response(query, reasoning_plan, external_data)
         
         return final_response
+    
+    async def _keyword_analysis(self, query: str) -> dict:
+        """Fallback analysis using keyword matching when Gemini fails"""
+        query_lower = query.lower()
+        
+        needs_weather = any(word in query_lower for word in [
+            'weather', 'temperature', 'forecast', 'rain', 'snow', 
+            'cloud', 'humid', '°c', '°f', 'degrees'
+        ])
+        
+        needs_wikipedia = any(word in query_lower for word in [
+            'who', 'what is', 'when was', 'history of', 'invented', 
+            'discovered', 'tell me about', 'explain', 'biography'
+        ])
+        
+        return {
+            "needs_weather": needs_weather,
+            "needs_wikipedia": needs_wikipedia,
+            "reasoning": "Using keyword-based analysis due to API limitations"
+        }
+    
+    async def _fallback_response(self, query: str, plan: dict, external_data: dict) -> dict:
+        """Generate response without Gemini when API fails"""
+        
+        # Build answer from available data
+        answer_parts = []
+        
+        if external_data.get("weather") and "error" not in external_data["weather"]:
+            weather = external_data["weather"]
+            answer_parts.append(
+                f"Weather in {weather.get('location', 'the location')}: "
+                f"{weather.get('description', 'unknown')}, {weather.get('temperature', 'unknown')}°C"
+            )
+        
+        if external_data.get("wikipedia") and "error" not in external_data["wikipedia"]:
+            wiki = external_data["wikipedia"]
+            answer_parts.append(
+                f"Wikipedia: {wiki.get('summary', 'Information available')}"
+            )
+        
+        if not answer_parts:
+            answer_parts.append(f"I understand you're asking about: {query}")
+        
+        return {
+            "reasoning": "Processed with fallback mode due to API rate limits",
+            "answer": " | ".join(answer_parts)
+        }
     
     async def _analyze_query(self, query: str) -> dict:
         """Use Gemini to analyze the query and decide on tool usage"""
@@ -86,6 +171,7 @@ class ReasoningAgent:
     """
         
         try:
+            print("Making analysis request to Gemini...")
             response = self.model.generate_content(system_prompt + "\n\nUser query: " + query)
             response_text = response.text
             
@@ -182,7 +268,7 @@ class ReasoningAgent:
         """
         
         try:
-            print("Generating final response with Gemini...")
+            print("Making final response request to Gemini...")
             response = self.model.generate_content(system_prompt + "\n\n" + user_prompt)
             response_text = response.text
             print(f"Raw Gemini response: {response_text}")
@@ -198,7 +284,7 @@ class ReasoningAgent:
         except Exception as e:
             print(f"Gemini response generation failed: {e}")
             # Fallback response
-            fallback_reasoning = f"I analyzed your query and decided to {'use external APIs' if external_data else 'answer directly'}."
+            fallback_reasoning = f"I analyzed your query and decided to {'use external APIs' if external_data else 'answer directly'}. Error during response generation: {str(e)}"
             fallback_answer = self._generate_fallback_answer(query, external_data)
             
             return {
@@ -235,43 +321,35 @@ class ReasoningAgent:
         return None
     
     def _extract_search_term(self, query: str) -> str:
-        """Extract search term for Wikipedia - improved version"""
+        """Extract search term for Wikipedia"""
         # Remove question marks and common phrases
-        clean_query = query.strip('?.!').lower()
+        clean_query = query.strip('?.!')
         
-        # Common patterns for question removal
-        patterns_to_remove = [
-            r'^is ', r'^does ', r'^do ', r'^can ', r'^could ', r'^will ', r'^would ',
-            r'^what is ', r'^who is ', r'^tell me about ', r'^explain ',
-            r'^give me information about ', r'^show me details about ',
-            r' have a wikipedia page$', r' have wikipedia page$', r' on wikipedia$'
+        # Common patterns
+        patterns = [
+            r"who (is|was|invented|created|discovered) (.+)",
+            r"what is (.+)",
+            r"tell me about (.+)",
+            r"explain (.+)",
+            r"when was (.+)",
+            r"history of (.+)"
         ]
         
-        # Remove common question patterns
-        for pattern in patterns_to_remove:
-            clean_query = re.sub(pattern, '', clean_query).strip()
+        for pattern in patterns:
+            match = re.search(pattern, clean_query.lower())
+            if match:
+                return match.group(1).strip().title()
         
-        # If the query is empty after cleaning, use the original but clean it
-        if not clean_query:
-            clean_query = query.strip('?.!')
-        
-        # Remove common stop words and question words
-        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
-                    'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-                    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-                    'should', 'may', 'might', 'can', 'could', 'what', 'who', 'where',
-                    'when', 'why', 'how', 'which', 'tell', 'me', 'about', 'explain'}
-        
+        # If no pattern matches, use the main noun phrase
         words = clean_query.split()
-        filtered_words = [word for word in words if word.lower() not in stop_words]
+        if len(words) > 2:
+            # Skip question words and return the main subject
+            question_words = ['who', 'what', 'when', 'where', 'why', 'how', 'which', 'tell', 'me', 'about', 'explain']
+            main_words = [word for word in words if word.lower() not in question_words]
+            if main_words:
+                return ' '.join(main_words[:3]).title()
         
-        if filtered_words:
-            # Take up to 4 words to avoid overly long search terms
-            search_term = ' '.join(filtered_words[:4])
-            return search_term.title()
-        
-        # Fallback: use the original query but limit length
-        return clean_query[:50].title()
+        return clean_query.title()
     
     def _parse_response(self, response: str) -> tuple:
         """Parse Gemini response into reasoning and answer parts"""
